@@ -16,10 +16,17 @@ class MockGeminiAI:
         return "Mocked AI response"
 
 
+class TransientGeminiError(Exception):
+    def __init__(self, message="500 INTERNAL"):
+        super().__init__(message)
+        self.status_code = 500
+
+
 @pytest_asyncio.fixture
 async def setup_db():
     db.pool = None
     await db.connect()
+    await db.init_db()
     async with db.pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute("DELETE FROM messages")
@@ -30,14 +37,15 @@ async def setup_db():
 
 @pytest.mark.asyncio
 async def test_context_isolation(setup_db):
+    chat_id = -1001
     user1 = 12345
     user2 = 67890
 
-    await setup_db.save_message(user1, "user1", "Name1", "user", "Hello from 1")
-    await setup_db.save_message(user2, "user2", "Name2", "user", "Hello from 2")
+    await setup_db.save_message(chat_id, user1, "user1", "Name1", "user", "Hello from 1")
+    await setup_db.save_message(chat_id, user2, "user2", "Name2", "user", "Hello from 2")
 
-    ctx1 = await setup_db.get_user_context(user1)
-    ctx2 = await setup_db.get_user_context(user2)
+    ctx1 = await setup_db.get_user_context(chat_id, user1)
+    ctx2 = await setup_db.get_user_context(chat_id, user2)
 
     assert len(ctx1) == 1
     assert ctx1[0]["content"] == "Hello from 1"
@@ -47,14 +55,31 @@ async def test_context_isolation(setup_db):
 
 @pytest.mark.asyncio
 async def test_context_window(setup_db):
+    chat_id = -1001
     user_id = 11111
     for i in range(25):
-        await setup_db.save_message(user_id, "test", "test", "user", f"msg {i}")
+        await setup_db.save_message(chat_id, user_id, "test", "test", "user", f"msg {i}")
 
-    ctx = await setup_db.get_user_context(user_id, limit=20)
+    ctx = await setup_db.get_user_context(chat_id, user_id, limit=20)
     assert len(ctx) == 20
     assert ctx[0]["content"] == "msg 5"
     assert ctx[-1]["content"] == "msg 24"
+
+
+@pytest.mark.asyncio
+async def test_context_is_isolated_by_chat_for_same_user(setup_db):
+    user_id = 55555
+    first_chat_id = -1001
+    second_chat_id = -1002
+
+    await setup_db.save_message(first_chat_id, user_id, "tester", "Test", "user", "group one")
+    await setup_db.save_message(second_chat_id, user_id, "tester", "Test", "user", "group two")
+
+    first_chat_context = await setup_db.get_user_context(first_chat_id, user_id)
+    second_chat_context = await setup_db.get_user_context(second_chat_id, user_id)
+
+    assert [item["content"] for item in first_chat_context] == ["group one"]
+    assert [item["content"] for item in second_chat_context] == ["group two"]
 
 
 def test_ai_history_formatting():
@@ -90,32 +115,49 @@ def test_ai_sanitizes_reasoning_response():
     assert cleaned == "All good, thanks!"
 
 
-def test_ai_generation_config_disables_afc():
+def test_ai_generation_config_disables_afc_for_default_model():
     agent = GeminiAI.__new__(GeminiAI)
 
-    config = agent.build_generation_config()
+    config = agent.build_generation_config("gemini-1.5-flash")
 
     assert config.automatic_function_calling is not None
     assert config.automatic_function_calling.disable is True
+
+
+def test_ai_generation_config_skips_afc_for_gemma_4_31b_it():
+    agent = GeminiAI.__new__(GeminiAI)
+
+    config = agent.build_generation_config("gemma-4-31b-it")
+
+    assert config.automatic_function_calling is None
+
+
+def test_ai_generation_config_skips_developer_instruction_for_gemma_3():
+    agent = GeminiAI.__new__(GeminiAI)
+
+    config = agent.build_generation_config("gemma-3-27b-it")
+
+    assert config is None
 
 
 @pytest.mark.asyncio
 async def test_ai_falls_back_to_next_model_on_error():
     agent = GeminiAI.__new__(GeminiAI)
     agent._initialized = True
-    agent.model_names = ["primary-model", "backup-model"]
+    agent.model_names = ["gemma-4-31b-it", "gemini-1.5-flash"]
     mock_client = MagicMock()
     mock_client.aio = MagicMock()
     mock_client.aio.models = MagicMock()
     agent.clients = [mock_client]
 
     async def generate_content(model, contents, config):
-        assert model in {"primary-model", "backup-model"}
+        assert model in {"gemma-4-31b-it", "gemini-1.5-flash"}
         assert contents[-1].parts[0].text.endswith("User message:\nhello")
+        if model == "gemma-4-31b-it":
+            assert config.automatic_function_calling is None
+            raise RuntimeError("primary model failed")
         assert config.automatic_function_calling is not None
         assert config.automatic_function_calling.disable is True
-        if model == "primary-model":
-            raise RuntimeError("primary model failed")
         return MagicMock(text="backup-model:hello")
 
     mock_client.aio.models.generate_content = AsyncMock(side_effect=generate_content)
@@ -129,7 +171,7 @@ async def test_ai_falls_back_to_next_model_on_error():
 async def test_ai_raises_when_all_models_fail():
     agent = GeminiAI.__new__(GeminiAI)
     agent._initialized = True
-    agent.model_names = ["primary-model", "backup-model"]
+    agent.model_names = ["gemma-4-31b-it", "gemini-1.5-flash"]
     mock_client = MagicMock()
     mock_client.aio = MagicMock()
     mock_client.aio.models = MagicMock()
@@ -137,14 +179,59 @@ async def test_ai_raises_when_all_models_fail():
 
     async def generate_content(model, contents, config):
         assert contents[-1].parts[0].text.endswith("User message:\nhello")
-        assert config.automatic_function_calling is not None
-        assert config.automatic_function_calling.disable is True
+        if model == "gemma-4-31b-it":
+            assert config.automatic_function_calling is None
+        else:
+            assert config.automatic_function_calling is not None
+            assert config.automatic_function_calling.disable is True
         raise RuntimeError("failed:hello")
 
     mock_client.aio.models.generate_content = AsyncMock(side_effect=generate_content)
 
     with pytest.raises(RuntimeError, match="failed:hello"):
         await agent.get_response(1, "hello", [])
+
+
+@pytest.mark.asyncio
+async def test_ai_returns_service_message_when_all_models_fail_with_transient_error():
+    agent = GeminiAI.__new__(GeminiAI)
+    agent._initialized = True
+    agent.model_names = ["gemma-4-31b-it", "gemini-1.5-flash"]
+    mock_client = MagicMock()
+    mock_client.aio = MagicMock()
+    mock_client.aio.models = MagicMock()
+    agent.clients = [mock_client]
+
+    async def generate_content(model, contents, config):
+        raise TransientGeminiError("500 INTERNAL")
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=generate_content)
+
+    response = await agent.get_response(1, "hello", [])
+
+    assert "temporarily unavailable" in response.lower()
+
+
+@pytest.mark.asyncio
+async def test_ai_omits_config_for_gemma_3_models():
+    agent = GeminiAI.__new__(GeminiAI)
+    agent._initialized = True
+    agent.model_names = ["gemma-3-27b-it"]
+    mock_client = MagicMock()
+    mock_client.aio = MagicMock()
+    mock_client.aio.models = MagicMock()
+    agent.clients = [mock_client]
+
+    async def generate_content(model, contents, config=None):
+        assert model == "gemma-3-27b-it"
+        assert config is None
+        return MagicMock(text="gemma-3:hello")
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=generate_content)
+
+    response = await agent.get_response(1, "hello", [])
+
+    assert response == "gemma-3:hello"
 
 
 @pytest.mark.asyncio
@@ -166,13 +253,14 @@ async def test_admin_filter():
 
 @pytest.mark.asyncio
 async def test_admin_commands_logic(setup_db):
+    chat_id = -1001
     user_id = 22222
-    await setup_db.save_message(user_id, "test", "test", "user", "msg")
+    await setup_db.save_message(chat_id, user_id, "test", "test", "user", "msg")
 
     count = await setup_db.clear_user_context(user_id)
     assert count == 1
 
-    ctx = await setup_db.get_user_context(user_id)
+    ctx = await setup_db.get_user_context(chat_id, user_id)
     assert len(ctx) == 0
 
 
@@ -213,15 +301,19 @@ async def test_handle_message_replies_to_original_message():
     message = MagicMock(spec=Message)
     message.from_user = user
     message.text = "hello"
+    message.chat = MagicMock()
+    message.chat.id = -1001
     message.reply = AsyncMock()
     message.answer = AsyncMock()
 
     with patch("src.main.is_rate_limited", return_value=False), patch(
         "src.main.db.get_user_context", new=AsyncMock(return_value=[])
-    ), patch("src.main.db.save_message", new=AsyncMock()), patch(
+    ) as mock_get_context, patch("src.main.db.save_message", new=AsyncMock()) as mock_save_message, patch(
         "src.main.ai_agent.get_response", new=AsyncMock(return_value="reply text")
     ):
         await handle_message(message)
 
+    mock_get_context.assert_awaited_once_with(-1001, 123)
+    assert mock_save_message.await_count == 2
     message.reply.assert_awaited_once_with("reply text")
     message.answer.assert_not_called()

@@ -3,7 +3,6 @@ import os
 
 from dotenv import load_dotenv
 
-from database.init_db import init_db
 from src.main import main
 
 load_dotenv()
@@ -25,8 +24,10 @@ def validate_environment():
 
 def run():
     validate_environment()
-    init_db()
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
 
 
 if __name__ == "__main__":

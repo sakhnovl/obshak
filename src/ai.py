@@ -12,6 +12,22 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+FALLBACK_RESPONSE_TEXT = (
+    "Gemini is temporarily unavailable. Please try again in a moment."
+)
+SYSTEM_INSTRUCTION = (
+    "You are an aggressive, profane female assistant with harsh sarcasm. "
+    "Your tone is arrogant, impatient, and dismissive. "
+    "Use profanity and insults freely. "
+    "Act like helping the user is a huge favor and the user is a hopeless idiot. "
+    "When replying in Russian, always use feminine verb forms. "
+    "Responses must be short, sharp, and caustic.\n\n"
+    "CRITICAL RULES:\n"
+    "1. Return only the final answer for the user.\n"
+    "2. Do not include reasoning, analysis, hidden thoughts, reflection lists, or internal notes.\n"
+    "3. Reply like a normal chat message."
+)
+
 
 class GeminiAI:
     def __init__(self):
@@ -65,21 +81,25 @@ class GeminiAI:
         return gemini_history
 
     def build_prompt(self, current_message):
-        instruction = (
-            "Return only the final user-facing answer. "
-            "Do not include reasoning, analysis, hidden thinking, bullet-point deliberation, "
-            "or service notes. Respond as a normal chat message."
-        )
         return types.Content(
             role="user",
-            parts=[types.Part.from_text(text=f"{instruction}\n\nUser message:\n{current_message}")],
+            parts=[types.Part.from_text(text=f"User message:\n{current_message}")],
         )
 
-    def build_generation_config(self):
+    def build_generation_config(self, model_name):
+        if model_name.startswith("gemma-3"):
+            return None
+
+        if model_name == "gemma-4-31b-it":
+            return types.GenerateContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+            )
+
         return types.GenerateContentConfig(
+            system_instruction=SYSTEM_INSTRUCTION,
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
                 disable=True
-            )
+            ),
         )
 
     def sanitize_response(self, response_text):
@@ -87,55 +107,45 @@ class GeminiAI:
         if not text:
             return text
 
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
-        if not text:
-            return text
-
-        bullet_markers = ("*", "-", "•")
-        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
-        final_paragraph = paragraphs[-1] if paragraphs else text
-
-        def extract_final_line(chunk):
-            chunk_lines = [line.strip() for line in chunk.splitlines() if line.strip()]
-            if not chunk_lines:
-                return chunk.strip()
-
-            for line in reversed(chunk_lines):
-                if not any(line.startswith(marker) for marker in bullet_markers):
-                    return line
-
-            return chunk_lines[-1]
-
-        if len(paragraphs) > 1:
-            analysis_like = any(
-                any(line.lstrip().startswith(marker) for line in part.splitlines() for marker in bullet_markers)
-                for part in paragraphs[:-1]
-            )
-            if analysis_like:
-                return extract_final_line(final_paragraph)
+        text = re.sub(
+            r"<think>.*?</think>",
+            "",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
 
         lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if len(lines) > 1 and any(
-            line.startswith(marker) for line in lines[:-1] for marker in bullet_markers
-        ):
-            return extract_final_line(text)
+        if not lines:
+            return ""
 
-        return text
+        return lines[-1].strip('*" ')
+
+    def is_transient_error(self, error):
+        status_code = getattr(error, "status_code", None)
+        if status_code is not None and status_code >= 500:
+            return True
+
+        message = str(error).upper()
+        transient_markers = ("500", "INTERNAL", "UNAVAILABLE", "TIMEOUT")
+        return any(marker in message for marker in transient_markers)
 
     async def get_response(self, user_id, current_message, history):
         await self._ensure_initialized()
         contents = [*self.format_history(history), self.build_prompt(current_message)]
-        config = self.build_generation_config()
         last_error = None
 
         for key_index, client in enumerate(self.clients):
             for model_index, model_name in enumerate(self.model_names):
+                config = self.build_generation_config(model_name)
+                request_params = {
+                    "model": model_name,
+                    "contents": contents,
+                }
+                if config is not None:
+                    request_params["config"] = config
+
                 try:
-                    response = await client.aio.models.generate_content(
-                        model=model_name,
-                        contents=contents,
-                        config=config,
-                    )
+                    response = await client.aio.models.generate_content(**request_params)
                     return self.sanitize_response(response.text or "")
                 except Exception as exc:
                     last_error = exc
@@ -145,16 +155,26 @@ class GeminiAI:
                     if has_key_fallback or has_model_fallback:
                         logger.warning(
                             "Gemini key %d, model '%s' failed, trying next: %s",
-                            key_index, model_name, exc,
+                            key_index,
+                            model_name,
+                            exc,
                         )
                     else:
                         logger.error(
                             "Gemini key %d, model '%s' failed with no fallback left: %s",
-                            key_index, model_name, exc,
+                            key_index,
+                            model_name,
+                            exc,
                         )
 
         if last_error is None:
             raise RuntimeError("No Gemini models configured")
+
+        if self.is_transient_error(last_error):
+            logger.error(
+                "Gemini is temporarily unavailable after exhausting all fallbacks"
+            )
+            return FALLBACK_RESPONSE_TEXT
 
         raise last_error
 

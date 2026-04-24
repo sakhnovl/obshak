@@ -26,6 +26,7 @@ load_dotenv()
 # Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN') or os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_IDS = [int(id_.strip()) for id_ in os.getenv('TELEGRAM_ADMIN_IDS', '').split(',') if id_.strip()]
+MAX_MESSAGE_LENGTH = 4000  # Telegram limit is 4096, leaving some room
 
 # Initialize AI agent
 ai_agent = get_ai_agent()
@@ -33,6 +34,10 @@ ai_agent = get_ai_agent()
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Suppress aiogram network noise
+logging.getLogger("aiogram").setLevel(logging.CRITICAL)
+logging.getLogger("aiogram.dispatcher").setLevel(logging.CRITICAL)
 
 RATE_LIMIT_WINDOW_SECONDS = 60
 RATE_LIMIT_MAX_REQUESTS = 5
@@ -48,6 +53,11 @@ def get_editable_message(callback: CallbackQuery) -> Message | None:
         return callback_message
     return None
 
+
+def get_message_chat_id(message: Message) -> int | None:
+    chat = getattr(message, "chat", None)
+    return getattr(chat, "id", None)
+
 class AdminFilter(BaseFilter):
     async def __call__(self, message: Message) -> bool:
         user = message.from_user
@@ -61,6 +71,31 @@ class AdminStates(StatesGroup):
     waiting_for_model_id = State()
     waiting_for_user_id = State()
 
+
+async def send_long_message(message: Message, text: str):
+    if len(text) <= MAX_MESSAGE_LENGTH:
+        await message.reply(text)
+        return
+
+    # Split text into chunks of MAX_MESSAGE_LENGTH
+    parts = []
+    while text:
+        if len(text) <= MAX_MESSAGE_LENGTH:
+            parts.append(text)
+            break
+        
+        # Try to find the last newline within the limit to avoid cutting sentences
+        split_index = text.rfind('\n', 0, MAX_MESSAGE_LENGTH)
+        if split_index == -1:
+            # No newline found, just cut at MAX_MESSAGE_LENGTH
+            split_index = MAX_MESSAGE_LENGTH
+            
+        parts.append(text[:split_index])
+        text = text[split_index:].lstrip()
+
+    for part in parts:
+        if part:
+            await message.reply(part)
 
 def is_rate_limited(request_times, current_time):
     window_start = current_time - RATE_LIMIT_WINDOW_SECONDS
@@ -325,7 +360,8 @@ async def cmd_clear_context(message: Message):
 async def handle_message(message: types.Message):
     user = message.from_user
     text = message.text
-    if not user or not text:
+    chat_id = get_message_chat_id(message)
+    if not user or not text or chat_id is None:
         return
 
     logger.info("Handling message from %s: %s...", user.id, text[:20])
@@ -339,11 +375,11 @@ async def handle_message(message: types.Message):
         return
 
     try:
-        history = await db.get_user_context(user_id)
-        await db.save_message(user_id, username, first_name, 'user', text)
+        history = await db.get_user_context(chat_id, user_id)
+        await db.save_message(chat_id, user_id, username, first_name, 'user', text)
         response_text = await ai_agent.get_response(user_id, text, history)
-        await message.reply(response_text)
-        await db.save_message(user_id, username, first_name, 'model', response_text)
+        await send_long_message(message, response_text)
+        await db.save_message(chat_id, user_id, username, first_name, 'model', response_text)
     except Exception as e:
         logger.error(f"Error handling message from {user_id}: {e}", exc_info=True)
         await message.answer("Sorry, I encountered an error. Please try again later.")
@@ -371,4 +407,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Bot stopped")
-
