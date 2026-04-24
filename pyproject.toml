@@ -1,0 +1,16 @@
+[tool.ruff]
+exclude = [
+    ".agent",
+    ".pytest_cache",
+    "__pycache__",
+]
+
+[tool.mypy]
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = [
+    "aiomysql",
+    "pymysql",
+]
+ignore_missing_imports = true
